@@ -52,3 +52,10 @@ def db_session():
         yield session
     finally:
         session.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_webhook_retry_delay(monkeypatch):
+    """Skip real sleeps between webhook retry attempts so retry/backoff
+    tests run instantly instead of taking several real seconds each."""
+    monkeypatch.setattr("app.alerts.webhook_client.time.sleep", lambda seconds: None)

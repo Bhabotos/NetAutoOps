@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     # the Phase 3 show commands, so they get their own read timeout.
     backup_command_timeout: int = 60
 
+    # Phase 5: n8n webhook integration for automation events. Left unset by
+    # default -- event delivery is then a safe no-op (logged, never sent)
+    # rather than pointing at nothing.
+    n8n_webhook_url: str | None = None
+    n8n_webhook_timeout: float = 5.0
+    n8n_webhook_max_retries: int = 3
+    n8n_webhook_retry_backoff_seconds: float = 1.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

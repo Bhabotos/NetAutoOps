@@ -13,7 +13,7 @@ NetAutoOps/
 │   ├── services/      # business logic, separate from HTTP layer
 │   ├── monitoring/    # vendor adapters, reachability check, Netmiko client
 │   ├── backup/        # structured backup file storage
-│   ├── alerts/        # (future phase)
+│   ├── alerts/        # event schema, webhook client, n8n integration
 │   └── utils/         # logging and shared helpers
 ├── tests/            # pytest test suite
 ├── config/
@@ -48,6 +48,12 @@ TCP_CHECK_TIMEOUT=3
 
 # Phase 4 configuration backups (reuses the credentials above)
 BACKUP_COMMAND_TIMEOUT=60
+
+# Phase 5 n8n webhook integration (empty = disabled, a safe no-op)
+N8N_WEBHOOK_URL=
+N8N_WEBHOOK_TIMEOUT=5
+N8N_WEBHOOK_MAX_RETRIES=3
+N8N_WEBHOOK_RETRY_BACKOFF_SECONDS=1
 ```
 
 Run the API server:
@@ -379,6 +385,126 @@ cat backups/cisco/<hostname>/<hostname>_<timestamp>.cfg
 ```
 
 If the backup comes back `failed` with a command-related message, check `logs/netautoops.log` for the exact error, then try running the same `backup_command` manually over SSH to confirm the correct syntax for your device's firmware/software version.
+
+## Phase 5 — n8n Integration
+
+Phase 5 lets monitoring and backup events trigger external automation (Telegram, email, tickets, etc.) via n8n, without NetAutoOps knowing or caring what happens downstream — it only ever POSTs a standard JSON payload to one configured webhook URL.
+
+**Safety rules enforced by design:** the webhook URL and every retry/timeout setting live only in `.env`; if `N8N_WEBHOOK_URL` is unset, event delivery is a logged no-op — nothing is ever sent anywhere by default; a webhook failure (timeout, connection error, 4xx/5xx, or anything unexpected) is caught and logged, never raised, so a broken or slow n8n instance can never crash or slow down a monitoring/backup API call; the webhook URL itself is treated like a credential and never appears unmasked in logs (n8n webhook paths embed an effectively-secret id).
+
+### Architecture
+
+```
+app/alerts/events.py           # EventType enum + the standard EventPayload schema
+app/alerts/webhook_client.py   # low-level HTTP POST: timeout, retry/backoff, error mapping
+app/alerts/event_service.py    # public interface: dispatch_event() / deliver_event() -- never raises
+app/api/events.py              # /events/* endpoints for discovery + manual testing
+```
+
+```
+Device check (Phase 3) ──┐
+Backup run (Phase 4)   ──┼──> event_service.dispatch_event() ──> webhook_client.send_webhook() ──> n8n
+                          │         (never raises)                 (timeout + retry + 4xx/5xx handling)
+POST /events/test        ─┘
+```
+
+`monitoring_service.py` and `backup_service.py` call `event_service.dispatch_event(...)` at the same points they already persist a result — no new code path, no chance of an event firing without a corresponding database record (or vice versa).
+
+### Standard events
+
+| Event | Fired when | Source |
+|---|---|---|
+| `device_down` | A health check finds the device unreachable | every occurrence, Phase 3 |
+| `device_recovered` | A health check succeeds (`UP`) immediately after a `DOWN`/`ERROR` check | only on the transition, Phase 3 |
+| `health_check_failed` | A health check errors out (unsupported platform, missing credentials, auth/timeout/unexpected failure) | every occurrence, Phase 3 |
+| `backup_success` | A configuration backup completes and the file is written | every occurrence, Phase 4 |
+| `backup_failed` | A configuration backup fails for any reason | every occurrence, Phase 4 |
+
+`device_recovered` is transition-only so a consistently healthy device doesn't fire an event on every routine check; the other four fire every time so an n8n workflow can decide for itself whether to de-duplicate/rate-limit.
+
+### Event payload
+
+Every event, regardless of source, has this shape (`details` carries event-specific extras):
+
+```json
+{
+  "event": "device_down",
+  "device_id": 1,
+  "hostname": "R1",
+  "ip_address": "192.168.1.10",
+  "status": "down",
+  "timestamp": "2026-09-16T23:05:00.123456+00:00",
+  "details": {
+    "error_message": "Device did not respond on the management port (TCP/22)",
+    "latency_ms": null
+  }
+}
+```
+
+`details` per event: `device_down`/`health_check_failed` carry `error_message` (+`latency_ms` for `device_down`); `device_recovered` carries `cpu_usage`/`memory_usage`; `backup_success` carries `filename`/`backup_size`; `backup_failed` carries `error_message`. `details` is always present as a key (possibly `null`), so an n8n node can safely reference `{{$json.details}}` without an existence check.
+
+### API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET  | `/events/types` | The five event names above, for building an n8n IF/Switch node |
+| POST | `/events/test` | Build and send one event for an existing device, and return whether it was delivered |
+
+`POST /events/test` body: `{"event": "device_down", "device_id": 1, "status": "down", "details": {...}}` (`status` and `details` optional). It never touches the monitoring/backup tables — it's purely for verifying the webhook path (payload shape, n8n reachability, retry behavior) end to end.
+
+### Testing
+
+`tests/test_events.py` mocks `httpx.post` (never opens a real socket) plus a `conftest.py` fixture that skips retry sleeps so slow tests don't accumulate. Covered:
+
+- event schema: standard payload shape, `details` passthrough, and Pydantic validation rejecting missing fields / an unknown event name
+- webhook client: successful delivery, URL-not-configured (no request attempted), timeout (retries then fails), connection failure (retries then fails), a transient timeout followed by success, HTTP 4xx (fails immediately, no retry), HTTP 5xx (retries then fails), and a response whose body can't be read (doesn't crash the error path)
+- a dedicated test asserting the webhook URL never appears unmasked in the logs
+- event service: `deliver_event`/`dispatch_event` never raise and return the correct bool in every case above
+- integration: monitoring dispatches `device_down`/`health_check_failed`/`device_recovered` at the right transitions and stays silent on consecutive healthy checks; backup dispatches `backup_success`/`backup_failed`
+- API endpoints: `/events/types`, `/events/test` (delivered, not-configured, 404, invalid event name)
+- regression: `/`, `/health`, `/devices`, `/monitoring/health`, `/backups` all re-checked in the same file
+
+```bash
+pytest tests/ -v
+```
+
+Live end-to-end verification performed for this phase (see the session's implementation, not part of the automated suite): a real `http.server`-based receiver on `127.0.0.1` confirmed an actual `httpx` POST is correctly delivered outside of mocks, and `POST /events/test` against the real database correctly returned `delivered: false` with no outbound attempt when `N8N_WEBHOOK_URL` was unset.
+
+### Testing with local n8n
+
+You don't need Docker or a public server to try this end-to-end:
+
+1. **Get n8n running somewhere reachable from this machine.** The quickest options: [n8n cloud](https://n8n.io) free trial, or n8n desktop. (This step is entirely your own n8n instance — NetAutoOps doesn't deploy or manage it.)
+2. **Create a workflow**: `Webhook` node (Production URL, POST) → `IF`/`Switch` node branching on `{{$json.event}}` → a `Telegram` or `Email` node on whichever branches you want notified (per the task, these aren't required yet — a `NoOp` or `Set` node is enough to prove the pipeline).
+3. Copy the webhook's **Production URL** into `.env`:
+   ```
+   N8N_WEBHOOK_URL=https://<your-n8n-host>/webhook/<your-webhook-id>
+   ```
+4. Restart NetAutoOps (or just re-trigger — `uvicorn --reload` picks up `.env` changes on restart) and send a test event:
+   ```bash
+   curl -X POST http://127.0.0.1:8001/events/test \
+     -H "Content-Type: application/json" \
+     -d '{"event": "device_down", "device_id": 1, "status": "down"}'
+   ```
+5. Check the n8n workflow's execution log — you should see the exact payload from the "Event payload" section above.
+6. Once that works, trigger it for real: `POST /monitoring/devices/1/check` against an unreachable device, or `POST /backups/devices/1` against an unsupported vendor, and watch the same event arrive from the real monitoring/backup flow instead of the test endpoint.
+
+If you don't want to set up n8n yet, use [webhook.site](https://webhook.site) instead — it hands you a disposable URL and shows every request it receives, which is enough to confirm NetAutoOps is sending the right payload before you build the n8n workflow. (The payload contains only inventory metadata — hostname, IP, status — never credentials, so this is safe to point at a public tool.)
+
+### n8n workflow diagram
+
+```
+NetAutoOps (monitoring/backup service)
+   ↓  POST JSON (see "Event payload" above)
+Webhook node (n8n)
+   ↓
+IF / Switch node on {{$json.event}}
+   ↓                    ↓                        ↓
+device_down /     backup_success /        (any other event)
+health_check_failed   backup_failed
+   ↓                    ↓
+Telegram or Email    Telegram or Email    (log / ignore for now)
+```
 
 ## Health Check
 

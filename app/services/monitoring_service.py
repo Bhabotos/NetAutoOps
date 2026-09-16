@@ -1,5 +1,7 @@
 from sqlalchemy.orm import Session
 
+from app.alerts import event_service
+from app.alerts.events import EventType
 from app.core.config import settings
 from app.models.device import Device
 from app.models.device_health import DeviceHealth, DeviceHealthStatus
@@ -9,6 +11,43 @@ from app.monitoring.vendor_adapters import UnsupportedPlatformError, get_vendor_
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _dispatch_health_event(
+    device: Device, previous_status: DeviceHealthStatus | None, health: DeviceHealth
+) -> None:
+    """Fire an automation event on a meaningful health transition.
+
+    device_down/health_check_failed fire on every occurrence (an n8n
+    workflow may want every failed check, not just the first);
+    device_recovered only fires when transitioning back to UP from a
+    DOWN/ERROR state, so a device that's already healthy doesn't spam a
+    "recovered" event on every routine check.
+    """
+    if health.status == DeviceHealthStatus.DOWN:
+        event_service.dispatch_event(
+            EventType.DEVICE_DOWN,
+            device,
+            status=health.status.value,
+            details={"error_message": health.error_message, "latency_ms": health.latency_ms},
+        )
+    elif health.status == DeviceHealthStatus.ERROR:
+        event_service.dispatch_event(
+            EventType.HEALTH_CHECK_FAILED,
+            device,
+            status=health.status.value,
+            details={"error_message": health.error_message},
+        )
+    elif health.status == DeviceHealthStatus.UP and previous_status in (
+        DeviceHealthStatus.DOWN,
+        DeviceHealthStatus.ERROR,
+    ):
+        event_service.dispatch_event(
+            EventType.DEVICE_RECOVERED,
+            device,
+            status=health.status.value,
+            details={"cpu_usage": health.cpu_usage, "memory_usage": health.memory_usage},
+        )
 
 
 def _save(
@@ -49,12 +88,16 @@ def run_health_check(db: Session, device: Device) -> DeviceHealth:
     """
     logger.info("Monitoring started device_id=%s ip=%s", device.id, device.ip_address)
 
+    previous = get_health_history(db, device.id, limit=1)
+    previous_status = previous[0].status if previous else None
+
     try:
         adapter = get_vendor_adapter(device.vendor)
     except UnsupportedPlatformError as exc:
         logger.warning("Unsupported platform device_id=%s vendor=%s", device.id, device.vendor)
         health = _save(db, device, DeviceHealthStatus.ERROR, error_message=str(exc))
         logger.info("Device checked device_id=%s status=%s", device.id, health.status)
+        _dispatch_health_event(device, previous_status, health)
         return health
 
     is_up, latency_ms = check_tcp_reachability(device.ip_address, timeout=settings.tcp_check_timeout)
@@ -67,6 +110,7 @@ def run_health_check(db: Session, device: Device) -> DeviceHealth:
             error_message="Device did not respond on the management port (TCP/22)",
         )
         logger.info("Device checked device_id=%s status=%s", device.id, health.status)
+        _dispatch_health_event(device, previous_status, health)
         return health
 
     if not settings.device_ssh_password:
@@ -79,6 +123,7 @@ def run_health_check(db: Session, device: Device) -> DeviceHealth:
             error_message="SSH credentials are not configured (set DEVICE_SSH_PASSWORD in .env)",
         )
         logger.info("Device checked device_id=%s status=%s", device.id, health.status)
+        _dispatch_health_event(device, previous_status, health)
         return health
 
     try:
@@ -89,6 +134,7 @@ def run_health_check(db: Session, device: Device) -> DeviceHealth:
             db, device, DeviceHealthStatus.ERROR, latency_ms=latency_ms, error_message=str(exc)
         )
         logger.info("Device checked device_id=%s status=%s", device.id, health.status)
+        _dispatch_health_event(device, previous_status, health)
         return health
     except Exception as exc:
         logger.error(
@@ -102,6 +148,7 @@ def run_health_check(db: Session, device: Device) -> DeviceHealth:
             error_message="Unexpected monitoring error",
         )
         logger.info("Device checked device_id=%s status=%s", device.id, health.status)
+        _dispatch_health_event(device, previous_status, health)
         return health
 
     outputs = result["outputs"]
@@ -128,6 +175,7 @@ def run_health_check(db: Session, device: Device) -> DeviceHealth:
         error_message="; ".join(command_errors.values()) if command_errors else None,
     )
     logger.info("Device checked device_id=%s status=%s", device.id, health.status)
+    _dispatch_health_event(device, previous_status, health)
     return health
 
 
@@ -135,7 +183,7 @@ def get_health_history(db: Session, device_id: int, skip: int = 0, limit: int = 
     return (
         db.query(DeviceHealth)
         .filter(DeviceHealth.device_id == device_id)
-        .order_by(DeviceHealth.checked_at.desc())
+        .order_by(DeviceHealth.checked_at.desc(), DeviceHealth.id.desc())
         .offset(skip)
         .limit(limit)
         .all()
@@ -150,7 +198,7 @@ def get_fleet_health(db: Session) -> list[tuple[Device, DeviceHealth | None]]:
         latest = (
             db.query(DeviceHealth)
             .filter(DeviceHealth.device_id == device.id)
-            .order_by(DeviceHealth.checked_at.desc())
+            .order_by(DeviceHealth.checked_at.desc(), DeviceHealth.id.desc())
             .first()
         )
         results.append((device, latest))

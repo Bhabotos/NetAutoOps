@@ -1,5 +1,7 @@
 from sqlalchemy.orm import Session
 
+from app.alerts import event_service
+from app.alerts.events import EventType
 from app.backup.storage import build_backup_target, write_backup_file
 from app.core.config import settings
 from app.models.backup import BackupStatus, DeviceBackup
@@ -13,6 +15,23 @@ logger = get_logger(__name__)
 
 class BackupNotFoundError(Exception):
     """Raised when a backup record cannot be found by id."""
+
+
+def _dispatch_backup_event(device: Device, backup: DeviceBackup) -> None:
+    if backup.status == BackupStatus.SUCCESS:
+        event_service.dispatch_event(
+            EventType.BACKUP_SUCCESS,
+            device,
+            status=backup.status.value,
+            details={"filename": backup.filename, "backup_size": backup.backup_size},
+        )
+    else:
+        event_service.dispatch_event(
+            EventType.BACKUP_FAILED,
+            device,
+            status=backup.status.value,
+            details={"error_message": backup.error_message},
+        )
 
 
 def _save(
@@ -55,6 +74,7 @@ def run_backup(db: Session, device: Device) -> DeviceBackup:
         logger.warning("Unsupported vendor for backup device_id=%s vendor=%s", device.id, device.vendor)
         backup = _save(db, device, BackupStatus.FAILED, error_message=str(exc))
         logger.info("Backup finished device_id=%s status=%s", device.id, backup.status)
+        _dispatch_backup_event(device, backup)
         return backup
 
     if not settings.device_ssh_password:
@@ -66,6 +86,7 @@ def run_backup(db: Session, device: Device) -> DeviceBackup:
             error_message="SSH credentials are not configured (set DEVICE_SSH_PASSWORD in .env)",
         )
         logger.info("Backup finished device_id=%s status=%s", device.id, backup.status)
+        _dispatch_backup_event(device, backup)
         return backup
 
     try:
@@ -74,11 +95,13 @@ def run_backup(db: Session, device: Device) -> DeviceBackup:
         logger.error("Backup connection/command failure device_id=%s reason=%s", device.id, exc)
         backup = _save(db, device, BackupStatus.FAILED, error_message=str(exc))
         logger.info("Backup finished device_id=%s status=%s", device.id, backup.status)
+        _dispatch_backup_event(device, backup)
         return backup
     except Exception as exc:
         logger.error("Unexpected backup error device_id=%s type=%s", device.id, type(exc).__name__)
         backup = _save(db, device, BackupStatus.FAILED, error_message="Unexpected backup error")
         logger.info("Backup finished device_id=%s status=%s", device.id, backup.status)
+        _dispatch_backup_event(device, backup)
         return backup
 
     try:
@@ -90,6 +113,7 @@ def run_backup(db: Session, device: Device) -> DeviceBackup:
             db, device, BackupStatus.FAILED, error_message="Failed to write backup file to disk"
         )
         logger.info("Backup finished device_id=%s status=%s", device.id, backup.status)
+        _dispatch_backup_event(device, backup)
         return backup
 
     logger.info("Backup file written device_id=%s path=%s size=%s", device.id, target.relative_path, size)
@@ -103,6 +127,7 @@ def run_backup(db: Session, device: Device) -> DeviceBackup:
         backup_size=size,
     )
     logger.info("Backup finished device_id=%s status=%s", device.id, backup.status)
+    _dispatch_backup_event(device, backup)
     return backup
 
 
