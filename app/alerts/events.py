@@ -13,6 +13,9 @@ class EventType(str, enum.Enum):
     HEALTH_CHECK_FAILED = "health_check_failed"
     BACKUP_SUCCESS = "backup_success"
     BACKUP_FAILED = "backup_failed"
+    INTERFACE_DOWN = "interface_down"
+    INTERFACE_RECOVERED = "interface_recovered"
+    INTERFACE_ERRORS_DETECTED = "interface_errors_detected"
 
 
 class EventPayload(BaseModel):

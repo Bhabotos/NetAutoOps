@@ -20,6 +20,10 @@ class BackupCommandError(Exception):
     """Raised when the connection succeeded but the backup command itself failed."""
 
 
+class InterfaceCommandError(Exception):
+    """Raised when the connection succeeded but the interfaces command itself failed."""
+
+
 def _build_connection_params(device: Device, adapter: VendorAdapter) -> dict:
     return {
         "device_type": adapter.netmiko_device_type,
@@ -48,7 +52,7 @@ def _open_connection(device: Device, adapter: VendorAdapter):
         raise NetmikoConnectionError("Authentication failed") from exc
     except NetmikoTimeoutException as exc:
         raise NetmikoConnectionError("Connection timed out") from exc
-    except (NetmikoConnectionError, BackupCommandError):
+    except (NetmikoConnectionError, BackupCommandError, InterfaceCommandError):
         raise
     except Exception as exc:
         raise NetmikoConnectionError(f"Unexpected connection error ({type(exc).__name__})") from exc
@@ -96,4 +100,24 @@ def fetch_running_config(device: Device, adapter: VendorAdapter) -> str:
         except Exception as exc:
             raise BackupCommandError(
                 f"{type(exc).__name__} while running '{adapter.backup_command}'"
+            ) from exc
+
+
+def fetch_interfaces_raw(device: Device, adapter: VendorAdapter) -> str:
+    """Open a read-only Netmiko session and retrieve raw interface status output.
+
+    Only the adapter's single, pre-defined read-only interfaces_command is
+    ever run (e.g. "show interfaces") -- no configuration mode is entered.
+    Raises NetmikoConnectionError for connection-level failures, or
+    InterfaceCommandError if the connection succeeded but the command itself
+    failed.
+    """
+    with _open_connection(device, adapter) as conn:
+        try:
+            return conn.send_command(
+                adapter.interfaces_command, read_timeout=settings.interfaces_command_timeout
+            )
+        except Exception as exc:
+            raise InterfaceCommandError(
+                f"{type(exc).__name__} while running '{adapter.interfaces_command}'"
             ) from exc

@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     n8n_webhook_max_retries: int = 3
     n8n_webhook_retry_backoff_seconds: float = 1.0
 
+    # Phase 7: interface discovery output is typically smaller than a full
+    # running-config but larger than a single show version/cpu/memory line.
+    interfaces_command_timeout: int = 30
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

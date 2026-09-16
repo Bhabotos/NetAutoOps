@@ -57,6 +57,9 @@ N8N_WEBHOOK_URL=
 N8N_WEBHOOK_TIMEOUT=5
 N8N_WEBHOOK_MAX_RETRIES=3
 N8N_WEBHOOK_RETRY_BACKOFF_SECONDS=1
+
+# Phase 7 interface discovery (reuses DEVICE_SSH_PASSWORD/DEVICE_ENABLE_SECRET)
+INTERFACES_COMMAND_TIMEOUT=30
 ```
 
 Run the API server:
@@ -568,11 +571,149 @@ A `HEALTHCHECK` hits `/health` every 30s so `docker ps` and `depends_on: conditi
 
 ### What was verified in this environment
 
-Both containers were built and run end-to-end here: `db` passed its `pg_isready` healthcheck, `app` connected to it, created all tables, and passed its own `/health` healthcheck. Every existing endpoint was re-verified against the containerized stack -- Phase 2 device CRUD, Phase 3 monitoring check + fleet health, Phase 4 backup trigger + list, Phase 5 event types -- all returned the expected status codes. Data survived a full container restart (named volume persistence confirmed), and the `logs`/`backups` bind mounts were confirmed to receive real writes from inside the container. The test-only stack was torn down afterward (`down -v`) and never left running.
+Both containers were built and run end-to-end here: `db` passed its `pg_isready` healthcheck, `app` connected to it, created all tables, and passed its own `/health` healthcheck. Every existing endpoint was re-verified against the containerized stack -- Phase 2 device CRUD, Phase 3 monitoring check + fleet health, Phase 4 backup trigger + list, Phase 5 event types -- all returned the expected status codes. Data survived a full container restart (named volume persistence confirmed), and the `logs`/`backups` bind mounts were confirmed to receive real writes from inside the container. The test-only stack was torn down afterward (`down -v`) and never left running. (Re-verified again in Phase 7 -- see below -- with the interface monitoring endpoints added to the same sweep.)
 
 ### requirements.txt
 
 No changes -- the same dependency set that runs on the host runs unchanged in the container (verified: `psycopg2-binary`'s wheel installs cleanly on `python:3.14-slim` with no extra system packages needed).
+
+## Phase 7 — Network Interface Monitoring
+
+Phase 7 adds interface-level discovery (link state, IP, speed/duplex, traffic rates, error counters) on top of the same Netmiko foundation Phases 3-4 already built, reusing the vendor-adapter pattern rather than introducing a second Netmiko integration.
+
+**Safety rules enforced by design:** only one pre-defined read-only command per vendor is ever run (`show interfaces` / `display interface` / `show port` -- none of these change device state), no credentials are hardcoded, and a failure at any stage (unreachable, auth, timeout, unsupported vendor, command failure, parsing failure, database failure) is caught and returned as a structured `status: "error"` result -- it never raises into FastAPI, and it never leaves a half-written row in the database.
+
+### Architecture
+
+Phase 7 extends the existing building blocks rather than duplicating them:
+
+```
+app/monitoring/vendor_adapters.py   # extended: VendorAdapter now also carries
+                                     # `interfaces_command` + `parse_interfaces`
+app/monitoring/netmiko_client.py    # extended: `fetch_interfaces_raw()` shares the
+                                     # same `_open_connection()` helper Phases 3-4 use
+app/models/interface.py             # NEW: `device_interfaces` table (FK -> devices.id)
+app/services/interface_service.py   # NEW: connect -> parse -> persist -> dispatch events
+app/api/interfaces.py               # NEW: /interfaces/* endpoints
+app/alerts/events.py                # extended: 3 new EventType members (existing
+                                     # webhook/event architecture, no new system)
+```
+
+**Interface check workflow** (`run_interface_check`, one call per device):
+
+1. Look up a vendor adapter (same lookup Phases 3-4 use). Unknown vendor -> `error` result, nothing else attempted.
+2. TCP-connect to the device's management port, exactly like Phase 3's health check. Unreachable -> `error` result, Netmiko never invoked.
+3. Confirm `DEVICE_SSH_PASSWORD` is configured.
+4. Open a Netmiko session and run only the adapter's `interfaces_command`. A connection-level failure or the command itself failing -> `error` result with a safe, hand-written message.
+5. Parse the raw output into a list of interfaces. A parsing exception -> `error` result rather than a half-parsed table.
+6. Persist one `device_interfaces` row per discovered interface, then compare each interface's new state against its previous snapshot to decide which n8n events (if any) to fire.
+
+Unlike `DeviceHealth`/`DeviceBackup` (one row per check attempt, success or failure), a failed interface check simply produces **zero** rows rather than an error row -- one check naturally maps to *many* interface rows on success, so there's no single row to attach a failure to; the failure is reported directly in the API response instead (see below).
+
+Every step is logged (interface monitoring started, device checked, interfaces discovered + count, successful collection, connection failure, parsing failure) without ever logging the password or secret.
+
+### Supported platforms and collected metrics
+
+| Vendor (case-insensitive) | Command | Fields available |
+|---|---|---|
+| Cisco  | `show interfaces` | name, admin/oper status, description, IP, speed, duplex, input/output rate, input/output errors |
+| Huawei | `display interface` | same as Cisco |
+| Nokia  | `show port` | name, admin/oper status only |
+
+Nokia SR OS's `show port` summary table (unlike Cisco/Huawei's single rich per-interface command) only carries link/admin state -- description, IP address, speed/duplex, and traffic counters live on separate per-port and router-interface commands not covered here. Every Nokia interface therefore comes back with those fields as `null`; this is a known, documented limitation rather than a parsing bug (see `_parse_nokia_interfaces` in `app/monitoring/vendor_adapters.py`). `admin_status`/`oper_status` are normalized to lowercase `"up"`/`"down"` across all three vendors so API filtering behaves identically regardless of which device answered.
+
+Adding a new vendor means adding `interfaces_command` + a `parse_interfaces` function to one `VendorAdapter` entry -- no other file changes, same pattern Phases 3-4 already established.
+
+> As with Phases 3-4, these regex parsers are best-effort against representative sample CLI text (validated in the test suite below), not a live device -- expect to adjust a regex for your specific firmware/software version.
+
+### Interface monitoring database
+
+New `device_interfaces` table, one row per interface per check, linked to `devices` via `device_id` (`ON DELETE CASCADE`):
+
+| Field | Type | Notes |
+|---|---|---|
+| id | integer, primary key | auto-increment |
+| device_id | integer, FK → devices.id | required |
+| interface_name | string | required, indexed |
+| description | string | null if unavailable/not set |
+| admin_status | string | normalized `"up"`/`"down"`, indexed |
+| oper_status | string | normalized `"up"`/`"down"`, indexed |
+| ip_address | string | null where the command doesn't expose it |
+| speed | string | vendor-reported text, e.g. `"1000Mb/s"` |
+| duplex | string | `"full"` / `"half"` / `"auto"` |
+| input_rate / output_rate | bigint | bits/sec where parseable |
+| input_errors / output_errors | bigint | counters |
+| checked_at | timestamp | set automatically, indexed |
+
+`GET`-side "current state" endpoints (below) return the **latest row per interface_name** rather than raw history, since an operator asking "which interfaces are down right now" wants a deduplicated snapshot, not every historical check -- the full history still exists in the table for anyone querying it directly.
+
+### API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/interfaces/devices/{device_id}/check` | Run a fresh interface discovery check now; returns a summary plus every interface found |
+| GET  | `/interfaces/devices/{device_id}` | Latest snapshot of every interface on one device (`?oper_status=up|down`, `?has_errors=true|false`) |
+| GET  | `/interfaces/health` | Latest snapshot of every interface across the whole fleet, same filters, annotated with device hostname/IP |
+| GET  | `/interfaces/{interface_id}` | A single interface snapshot row by id |
+
+All endpoints return `404` for an unknown device/interface id. `POST .../check` never returns a 5xx for a device-side failure -- the failure is the `201` response body (`status: "error"`, `interfaces: []`, `error_message` set).
+
+### Example usage
+
+```bash
+# Run a check for device 1 (add it via /devices first)
+curl -X POST http://127.0.0.1:8001/interfaces/devices/1/check
+
+# Current interface table for device 1
+curl http://127.0.0.1:8001/interfaces/devices/1
+
+# Only the down interfaces on device 1
+curl "http://127.0.0.1:8001/interfaces/devices/1?oper_status=down"
+
+# Every interface with errors, fleet-wide
+curl "http://127.0.0.1:8001/interfaces/health?has_errors=true"
+```
+
+### n8n events
+
+Reuses the exact Phase 5 event architecture (`app/alerts/event_service.dispatch_event`) -- no second webhook system:
+
+| Event | Fired when |
+|---|---|
+| `interface_down` | Every check where an interface's `oper_status` is `down` (same "every occurrence" convention as `device_down`) |
+| `interface_recovered` | Only on the `down` → `up` transition for that interface (same convention as `device_recovered`) |
+| `interface_errors_detected` | Every check where an interface has any input or output errors |
+
+Payload shape is the same standard `EventPayload` from Phase 5, with `details.interface_name` plus event-specific extras (`input_errors`/`output_errors` for the errors event). No real Telegram/email alerts are sent by this phase -- exactly like Phase 5, delivery is a no-op unless `N8N_WEBHOOK_URL` is configured, and even then it's just an HTTP POST to your own workflow.
+
+### Testing
+
+`tests/test_interfaces.py` mocks Netmiko entirely (same approach as Phases 3-4). Covered:
+
+- vendor parsing for all three vendors against synthetic sample CLI text, including the Nokia null-field limitation
+- Netmiko interface fetch: success, auth failure, timeout, command failure (mocked `ConnectHandler`)
+- orchestration service: full success path, unreachable device, unsupported vendor, missing credentials, auth failure, command failure, parsing failure, and an unexpected-exception path
+- interface DOWN detection, recovery (transition-only), errors-detected, and no-spam-on-consecutive-healthy-checks -- each asserting the exact `EventType` dispatched
+- database: rows created on success, latest-snapshot-only deduplication across repeated checks, `oper_status`/`has_errors` filtering
+- API endpoints: `POST .../check`, `GET .../devices/{id}` with filters, `GET /interfaces/health`, `GET .../{id}`, and all 404s
+- regression: `/`, `/health`, `/devices`, `/monitoring/health`, `/backups`, `/events/types` all re-checked in the same file
+
+```bash
+pytest tests/ -v
+```
+
+### Lab testing (GNS3 / EVE-NG)
+
+No real network device was available in this environment (consistent with every prior phase). Validated via mocked Netmiko, plus live runs against a safe RFC 5737 `TEST-NET` address (unreachable path) and an unsupported-vendor device -- both re-verified inside the Docker Compose stack as well as the host `uvicorn` setup, with zero files or credentials touched on either target.
+
+To try this against a real lab device, reuse the Phase 3 lab setup, then:
+
+```bash
+curl -X POST http://127.0.0.1:8001/interfaces/devices/<id>/check
+curl http://127.0.0.1:8001/interfaces/devices/<id>
+```
+
+If fields come back `null` that you expect your device to expose, check `logs/netautoops.log` for a parsing-related warning, then compare the raw output of `show interfaces`/`display interface`/`show port` run manually over SSH against the regexes in `app/monitoring/vendor_adapters.py` -- the same adjustment process documented for Phases 3-4.
 
 ## Health Check
 
