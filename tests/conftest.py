@@ -59,3 +59,18 @@ def _no_webhook_retry_delay(monkeypatch):
     """Skip real sleeps between webhook retry attempts so retry/backoff
     tests run instantly instead of taking several real seconds each."""
     monkeypatch.setattr("app.alerts.webhook_client.time.sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_scheduler():
+    """Ensure no background scheduler thread survives past a single test.
+
+    The app's TestClient fixture never triggers the FastAPI lifespan (see
+    its comment above), so the scheduler only ever starts in tests that
+    call start_scheduler() directly -- this guarantees it's stopped again
+    afterward regardless of how the test exits.
+    """
+    from app.scheduler.scheduler import stop_scheduler
+
+    yield
+    stop_scheduler()

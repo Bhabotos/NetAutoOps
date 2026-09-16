@@ -14,6 +14,7 @@ NetAutoOps/
 │   ├── monitoring/    # vendor adapters, reachability check, Netmiko client
 │   ├── backup/        # structured backup file storage
 │   ├── alerts/        # event schema, webhook client, n8n integration
+│   ├── scheduler/      # background job scheduler (health/backup/interface checks)
 │   └── utils/         # logging and shared helpers
 ├── tests/            # pytest test suite
 ├── config/
@@ -60,6 +61,12 @@ N8N_WEBHOOK_RETRY_BACKOFF_SECONDS=1
 
 # Phase 7 interface discovery (reuses DEVICE_SSH_PASSWORD/DEVICE_ENABLE_SECRET)
 INTERFACES_COMMAND_TIMEOUT=30
+
+# Phase 8 scheduled automated checks (no new credentials)
+SCHEDULER_ENABLED=true
+HEALTH_CHECK_INTERVAL_MINUTES=15
+BACKUP_INTERVAL_MINUTES=1440
+INTERFACE_CHECK_INTERVAL_MINUTES=15
 ```
 
 Run the API server:
@@ -714,6 +721,140 @@ curl http://127.0.0.1:8001/interfaces/devices/<id>
 ```
 
 If fields come back `null` that you expect your device to expose, check `logs/netautoops.log` for a parsing-related warning, then compare the raw output of `show interfaces`/`display interface`/`show port` run manually over SSH against the regexes in `app/monitoring/vendor_adapters.py` -- the same adjustment process documented for Phases 3-4.
+
+## Phase 8 — Scheduled Automated Checks
+
+Phase 8 automates what Phases 3, 4, and 7 previously required a manual `POST .../check` for: health checks, configuration backups, and interface discovery now run on a background schedule for every device in the inventory, with no new monitoring/backup/interface logic of its own -- it only reuses the existing service-layer functions and fans them out across devices.
+
+**Safety rules enforced by design:** the scheduler calls the exact same `run_health_check` / `run_backup` / `run_interface_check` functions the manual API endpoints call -- same read-only commands, same credential handling, same never-raises contract. A single device failing (unreachable, bad creds, unsupported vendor, or even a genuinely unexpected bug) is caught and counted, never allowed to abort the rest of the run.
+
+### Architecture
+
+```
+app/scheduler/jobs.py        # NEW: fans a check function out across every device,
+                              # counting processed/succeeded/failed; reuses
+                              # monitoring_service / backup_service / interface_service
+                              # as-is -- zero duplicated monitoring/backup logic
+app/scheduler/scheduler.py   # NEW: APScheduler BackgroundScheduler setup --
+                              # registers the three jobs, starts/stops with the app
+app/api/scheduler.py         # NEW: GET /scheduler/status
+app/main.py                  # extended: lifespan now starts the scheduler on
+                              # startup and stops it on shutdown
+```
+
+```
+FastAPI startup ──> start_scheduler() ──> BackgroundScheduler (one native thread)
+                                              │
+                    ┌─────────────────────────┼─────────────────────────┐
+                    ▼                         ▼                         ▼
+         every N min: health_check   every N min: interface_check   every N min: backup
+                    │                         │                         │
+                    ▼                         ▼                         ▼
+        for each device in inventory: call the existing run_*_check(db, device)
+                    │
+                    ▼
+        per-device try/except -> processed / succeeded / failed counters -> one log line
+```
+
+`BackgroundScheduler` (not `AsyncIOScheduler`) was chosen deliberately: every route handler and service function in this codebase is synchronous (sync `def`, sync SQLAlchemy sessions) -- a plain background thread matches that style with no async/await bridging required anywhere.
+
+### Preventing overlapping/duplicate jobs
+
+Two distinct problems, two distinct guards:
+
+1. **The same job firing again while still running** (e.g. a health check across a large fleet takes longer than the configured interval): every job is registered with `max_instances=1, coalesce=True`. If the next scheduled time arrives while the previous run is still in progress, APScheduler skips that tick entirely rather than running two copies concurrently or queueing a backlog.
+2. **Calling `start_scheduler()` more than once** (e.g. an accidental double-init): `start_scheduler()` checks for an already-running scheduler instance and returns it unchanged instead of creating a second one -- there is never more than one `BackgroundScheduler` (and therefore never duplicate job registrations) per process.
+
+### Configuration
+
+All three schedules and the on/off switch are plain environment variables (see `.env.example`) -- no code changes needed to retune them:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCHEDULER_ENABLED` | `true` | Set `false` to disable the background scheduler entirely (e.g. for a one-off script) |
+| `HEALTH_CHECK_INTERVAL_MINUTES` | `15` | How often every device gets a health check |
+| `BACKUP_INTERVAL_MINUTES` | `1440` | How often every device gets a configuration backup (daily by default -- heavier than a health check) |
+| `INTERFACE_CHECK_INTERVAL_MINUTES` | `15` | How often every device gets an interface discovery check |
+
+No new credentials -- scheduled checks authenticate exactly the way manual ones do, via `DEVICE_SSH_PASSWORD`/`DEVICE_ENABLE_SECRET`.
+
+### Available scheduled jobs
+
+| Job id | Reuses | Runs |
+|---|---|---|
+| `scheduled_health_check` | `monitoring_service.run_health_check` | Every `HEALTH_CHECK_INTERVAL_MINUTES` |
+| `scheduled_backup` | `backup_service.run_backup` | Every `BACKUP_INTERVAL_MINUTES` |
+| `scheduled_interface_check` | `interface_service.run_interface_check` | Every `INTERFACE_CHECK_INTERVAL_MINUTES` |
+
+Each job iterates every device currently in the inventory (no filtering by device status) and persists results exactly like the manual endpoints do -- a `DeviceHealth`/`DeviceBackup`/interface row per device, and the same n8n events (`device_down`, `backup_failed`, `interface_down`, etc. -- see Phases 5 and 7) fire exactly as they would from a manual check, since it's the same underlying function being called.
+
+**"Successful" vs "failed" per device**, for the job's own summary counters: a health check counts as successful whenever the check *completed* -- a device correctly found `DOWN` still counts as success (the monitoring code did its job correctly); only `ERROR` (the check itself couldn't complete: bad creds, unsupported vendor, connection failure) counts as failed. Backup and interface checks use their own existing success/failure status directly.
+
+### How to run / disable schedules
+
+Scheduling starts automatically with the app -- nothing extra to run:
+
+```bash
+uvicorn app.main:app --reload --port 8001   # scheduler starts in the same process
+```
+
+To disable it (e.g. while debugging something else and you don't want background Netmiko traffic), set in `.env`:
+
+```
+SCHEDULER_ENABLED=false
+```
+
+and restart the app. To change how often jobs run without touching code, just edit the `*_INTERVAL_MINUTES` values in `.env` and restart.
+
+### Inspecting scheduler status
+
+```bash
+curl http://127.0.0.1:8001/scheduler/status
+```
+
+```json
+{
+  "running": true,
+  "jobs": [
+    {"id": "scheduled_health_check", "next_run_time": "2026-09-17T00:28:26...", "trigger": "interval[0:15:00]"},
+    {"id": "scheduled_interface_check", "next_run_time": "2026-09-17T00:28:26...", "trigger": "interval[0:15:00]"},
+    {"id": "scheduled_backup", "next_run_time": "2026-09-18T00:13:26...", "trigger": "interval[1 day, 0:00:00]"}
+  ]
+}
+```
+
+`running: false` and an empty `jobs` list means the scheduler either hasn't started yet or `SCHEDULER_ENABLED=false`.
+
+### Logging
+
+Every run logs (in `logs/netautoops.log`, same as every other phase, never including credentials):
+
+- `Job started job=<name>`
+- `Job device failure job=<name> device_id=<id>` (with full traceback) if an individual device raises unexpectedly
+- `Job completed job=<name> processed=<n> succeeded=<n> failed=<n>`
+- `Job failed job=<name>` (with traceback) only if something breaks the job as a whole, e.g. a database connectivity problem -- individual device failures never reach this path
+
+### Testing
+
+`tests/test_scheduler.py` never opens a real socket or SSH session -- Netmiko is mocked exactly as in every prior phase's tests, and an autouse `conftest.py` fixture guarantees the background scheduler is stopped after every test so no thread leaks across the suite. Covered:
+
+- scheduler startup: all three jobs registered with the right ids, each with `max_instances=1`
+- `SCHEDULER_ENABLED=false` prevents startup entirely
+- starting twice reuses the same instance (no duplicate job registration)
+- configuration validation: sane defaults, and custom interval values are actually applied to the registered triggers
+- job execution reusing the real service functions (mocked at the Netmiko boundary): success, per-status failure counting (including the "DOWN counts as a successful check" rule above), multiple devices, and continuing after one device raises unexpectedly
+- a job with zero devices reports all-zero counts rather than erroring
+- the registered APScheduler job is proven to be the real job function (not a stub) by fetching it back from the scheduler and checking identity
+- API: `GET /scheduler/status` both before and after starting the scheduler
+- regression: `/`, `/health`, `/devices`, `/monitoring/health`, `/backups`, `/events/types`, `/interfaces/health` all re-checked in the same file
+
+```bash
+pytest tests/ -v
+```
+
+### Docker
+
+No Dockerfile/docker-compose.yml changes were needed -- the scheduler is just additional in-process behavior of the same `app.main:app` ASGI app already running under `uvicorn` in the container; `docker compose up` starts it automatically. Verified in this environment: rebuilt the image, brought up the full stack, and confirmed `Scheduler started ...` in the container logs plus a healthy `GET /scheduler/status` response before tearing the test stack down.
 
 ## Health Check
 

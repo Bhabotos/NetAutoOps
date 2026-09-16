@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     # running-config but larger than a single show version/cpu/memory line.
     interfaces_command_timeout: int = 30
 
+    # Phase 8: scheduled automated checks. Disable entirely with
+    # SCHEDULER_ENABLED=false (e.g. for one-off scripts that shouldn't run a
+    # background scheduler); the test suite never triggers the app's
+    # startup lifecycle at all, so it never starts the scheduler regardless
+    # of this setting.
+    scheduler_enabled: bool = True
+    health_check_interval_minutes: int = 15
+    backup_interval_minutes: int = 1440
+    interface_check_interval_minutes: int = 15
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
