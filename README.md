@@ -12,7 +12,7 @@ NetAutoOps/
 │   ├── api/          # FastAPI routers and Pydantic schemas
 │   ├── services/      # business logic, separate from HTTP layer
 │   ├── monitoring/    # vendor adapters, reachability check, Netmiko client
-│   ├── backup/        # (future phase)
+│   ├── backup/        # structured backup file storage
 │   ├── alerts/        # (future phase)
 │   └── utils/         # logging and shared helpers
 ├── tests/            # pytest test suite
@@ -45,6 +45,9 @@ DEVICE_SSH_PASSWORD=
 DEVICE_ENABLE_SECRET=
 NETMIKO_TIMEOUT=10
 TCP_CHECK_TIMEOUT=3
+
+# Phase 4 configuration backups (reuses the credentials above)
+BACKUP_COMMAND_TIMEOUT=60
 ```
 
 Run the API server:
@@ -246,6 +249,136 @@ To point this at a real lab device once one is available:
    curl -X POST http://127.0.0.1:8001/monitoring/devices/<id>/check
    ```
 6. If `cpu_usage`/`memory_usage` come back `null`, the regex in `app/monitoring/vendor_adapters.py` for that vendor's command output likely needs a small adjustment for your image/version — check `logs/netautoops.log` for the "Command failure" line naming which command failed, then compare against the raw output from running that same command manually over SSH.
+
+## Phase 4 — Configuration Backup (Netmiko)
+
+Phase 4 adds read-only configuration backups for inventory devices, built directly on the Phase 3 Netmiko foundation (same vendor-adapter pattern, same connection layer, same credential handling).
+
+**Safety rules enforced by design:** only a single, pre-defined read-only command is ever run per vendor (`show running-config` / `display current-configuration` / `admin display-config` — none of these change device state), no credentials are hardcoded, and a failed backup (unreachable, auth failure, unsupported vendor, command failure, or file write failure) is caught and stored as a `failed` record — it never raises an exception into FastAPI, and no partial/corrupt file is left on disk.
+
+### Architecture
+
+Phase 4 reuses the Phase 3 building blocks rather than duplicating them:
+
+```
+app/monitoring/vendor_adapters.py   # extended: VendorAdapter now also carries `backup_command`
+app/monitoring/netmiko_client.py    # extended: `fetch_running_config()` shares the same
+                                     # `_open_connection()` helper (and exception mapping)
+                                     # that Phase 3's collect_raw_outputs() uses
+app/backup/storage.py               # NEW: structured backup file path + disk write
+app/services/backup_service.py      # NEW: orchestrates fetch -> write -> persist
+app/models/backup.py                # NEW: `device_backups` table (FK -> devices.id)
+app/api/backups.py                  # NEW: /backups/* endpoints
+```
+
+**Backup workflow** (`run_backup`, one call per device):
+
+1. Look up a vendor adapter for `device.vendor` (same lookup Phase 3 uses). Unknown vendor → `failed` record, nothing else attempted.
+2. Confirm `DEVICE_SSH_PASSWORD` is configured. Missing → `failed` record explaining the missing env var.
+3. Open a Netmiko session and run only the adapter's `backup_command`. A connection-level failure (auth, timeout, unexpected) or the command itself failing → `failed` record with a safe, hand-written message (never the raw exception text).
+4. Only once the configuration text has been successfully retrieved does the code touch disk: compute the structured path, write the file, and record its size. If the write itself fails (e.g. disk full, permissions) → `failed` record; the device is never re-contacted to retry within the same call.
+5. Persist one `device_backups` row either way.
+
+Every step is logged (backup started, backup finished, unsupported vendor, connection/command failure, file write failure) without ever logging the password or secret.
+
+### Supported platforms
+
+Same three vendors as Phase 3, extended with one read-only backup command each:
+
+| Vendor (case-insensitive) | Netmiko device_type | Backup command |
+|---|---|---|
+| Cisco  | `cisco_ios`  | `show running-config` |
+| Huawei | `huawei`     | `display current-configuration` |
+| Nokia  | `nokia_sros` | `admin display-config` (read-only despite the "admin" prefix — prints config, does not change it) |
+
+Any other vendor string returns a `failed` result naming the unsupported vendor. Adding a new vendor means adding `backup_command` (and the existing monitoring fields) to one `VendorAdapter` entry — no other file changes.
+
+### Backup directory structure
+
+```
+backups/
+  <vendor>/
+    <device_hostname>/
+      <hostname>_<UTC timestamp>.cfg
+```
+
+Vendor and hostname are slugified (lowercased, unsafe characters replaced with `_`) before being used as directory/file names. Example: a Cisco device named `Lab Router 01` backed up produces `backups/cisco/lab_router_01/lab_router_01_20260916T223517Z.cfg`. `backups/` is git-ignored — backup content (potentially sensitive config) is never committed.
+
+### Backup metadata database
+
+New `device_backups` table, one row per backup attempt, linked to `devices` via `device_id` (`ON DELETE CASCADE`):
+
+| Field | Type | Notes |
+|---|---|---|
+| id | integer, primary key | auto-increment |
+| device_id | integer, FK → devices.id | required |
+| filename | string | null if the backup failed before a file was written |
+| file_path | string | path relative to the project root, null on failure |
+| status | enum (success, failed) | |
+| backup_size | integer (bytes) | null on failure |
+| created_at | timestamp | set automatically |
+| error_message | string | null on success |
+
+### API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/backups/devices/{device_id}` | Run a fresh configuration backup for the device right now |
+| GET  | `/backups` | Every backup record across all devices, most recent first (`skip`/`limit`) |
+| GET  | `/backups/devices/{device_id}` | Backup history for one device, most recent first |
+| GET  | `/backups/{backup_id}` | A single backup record by id |
+
+All endpoints return `404` if the referenced device/backup id doesn't exist. `POST .../devices/{id}` never returns a 5xx for a device-side failure — the failure is the `201` response body (`status: "failed"` with `error_message` set).
+
+### Example usage
+
+```bash
+# Run a backup for device 1 (add it via /devices first)
+curl -X POST http://127.0.0.1:8001/backups/devices/1
+
+# All backups
+curl http://127.0.0.1:8001/backups
+
+# Backup history for device 1
+curl http://127.0.0.1:8001/backups/devices/1
+
+# A single backup record
+curl http://127.0.0.1:8001/backups/1
+```
+
+### Testing
+
+`tests/test_backup.py` mocks Netmiko entirely (same approach as Phase 3) plus tests the filesystem layer directly against `tmp_path`. Covered:
+
+- storage layer: structured directory creation, filename slugification, file write + size reporting
+- Netmiko backup fetch: success, authentication failure, timeout, and command failure (mocked `ConnectHandler`)
+- orchestration service: full success path (mocked), a **real file actually written to a temp directory** (proves the storage integration, not just mocks), unsupported vendor, missing credentials, authentication failure, command failure, file write failure, and an unexpected-exception path
+- database: backup rows created, listed, and fetched by id; a real cascade-delete-linked device
+- API endpoints: `POST .../devices/{id}`, `GET /backups`, `GET .../devices/{id}`, `GET .../{id}`, and all 404s
+- regression: `/`, `/health`, `/devices`, `/monitoring/health` all re-checked in the same file
+
+```bash
+pytest tests/ -v
+```
+
+### Lab testing (GNS3 / EVE-NG)
+
+As with Phase 3, no real network device was available in this environment. The success path (an actual SSH session retrieving and saving a real running-config) is proven only via mocked Netmiko in the test suite — the failure paths (unsupported vendor, missing credentials) were additionally verified live against the real database using safe non-device targets, with zero files written to disk.
+
+To back up a real lab device once one is available, reuse the same setup as Phase 3's lab testing section, then:
+
+```bash
+# 1. Register the device (see Phase 3 for the full device-registration example)
+# 2. Make sure DEVICE_SSH_PASSWORD (and DEVICE_ENABLE_SECRET if needed) are set in .env
+# 3. Run a backup:
+curl -X POST http://127.0.0.1:8001/backups/devices/<id>
+
+# 4. Inspect the result and the file it wrote:
+curl http://127.0.0.1:8001/backups/devices/<id>
+cat backups/cisco/<hostname>/<hostname>_<timestamp>.cfg
+```
+
+If the backup comes back `failed` with a command-related message, check `logs/netautoops.log` for the exact error, then try running the same `backup_command` manually over SSH to confirm the correct syntax for your device's firmware/software version.
 
 ## Health Check
 

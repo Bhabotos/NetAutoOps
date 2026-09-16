@@ -19,6 +19,7 @@ class VendorAdapter:
     version_command: str
     cpu_command: str
     memory_command: str
+    backup_command: str
     parse_version: Callable[[str], dict]
     parse_cpu: Callable[[str], float | None]
     parse_memory: Callable[[str], float | None]
@@ -81,6 +82,7 @@ VENDOR_ADAPTERS: dict[str, VendorAdapter] = {
         version_command="show version",
         cpu_command="show processes cpu | include CPU utilization",
         memory_command="show memory statistics | include Processor",
+        backup_command="show running-config",
         parse_version=_parse_uptime_line,
         parse_cpu=_parse_cisco_cpu,
         parse_memory=_parse_cisco_memory,
@@ -90,6 +92,7 @@ VENDOR_ADAPTERS: dict[str, VendorAdapter] = {
         version_command="display version",
         cpu_command="display cpu-usage",
         memory_command="display memory-usage",
+        backup_command="display current-configuration",
         parse_version=_parse_uptime_line,
         parse_cpu=_parse_huawei_cpu,
         parse_memory=_parse_huawei_memory,
@@ -99,6 +102,10 @@ VENDOR_ADAPTERS: dict[str, VendorAdapter] = {
         version_command="show system information",
         cpu_command="show system cpu",
         memory_command="show system memory",
+        # "admin display-config" is Nokia SR OS's standard read-only command
+        # to print the full configuration to the terminal -- despite the
+        # "admin" prefix it does not change device state.
+        backup_command="admin display-config",
         parse_version=_parse_nokia_version,
         parse_cpu=_parse_nokia_cpu,
         parse_memory=_parse_nokia_memory,

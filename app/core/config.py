@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     netmiko_timeout: int = 10
     tcp_check_timeout: float = 3.0
 
+    # Phase 4: configuration backups can be much larger/slower to print than
+    # the Phase 3 show commands, so they get their own read timeout.
+    backup_command_timeout: int = 60
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
