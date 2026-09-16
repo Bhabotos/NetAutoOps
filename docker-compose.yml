@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-netautoops_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env before running docker compose}
+      POSTGRES_DB: ${POSTGRES_DB:-netautoops_db}
+    volumes:
+      # PostgreSQL 18+ images expect a single mount at /var/lib/postgresql
+      # (not the .../data subdirectory used by older images).
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-netautoops_user} -d ${POSTGRES_DB:-netautoops_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - netautoops_net
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Overrides the .env value: inside the compose network the database is
+      # reached by service name ("db"), not "localhost". Every other setting
+      # (DEVICE_SSH_PASSWORD, N8N_WEBHOOK_URL, timeouts, ...) passes through
+      # from .env unchanged via env_file above.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-netautoops_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-netautoops_db}
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+    networks:
+      - netautoops_net
+
+volumes:
+  postgres_data:
+
+networks:
+  netautoops_net:

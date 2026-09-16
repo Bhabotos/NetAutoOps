@@ -22,6 +22,9 @@ NetAutoOps/
 ├── .env              # local secrets, never committed
 ├── .env.example      # documents required env vars (no real values)
 ├── .gitignore
+├── Dockerfile         # multi-stage build, runs as non-root
+├── docker-compose.yml # app + PostgreSQL for a fully containerized deployment
+├── .dockerignore
 ├── README.md
 └── requirements.txt
 ```
@@ -505,6 +508,71 @@ health_check_failed   backup_failed
    ↓                    ↓
 Telegram or Email    Telegram or Email    (log / ignore for now)
 ```
+
+## Phase 6 — Docker Deployment
+
+Phase 6 packages NetAutoOps into a container and adds a `docker compose` stack (app + PostgreSQL) for a fully self-contained deployment, alongside the existing host-based (`uvicorn` directly) workflow -- both continue to work side by side using the same `.env`.
+
+**Safety note:** this phase is pure infrastructure -- containerizing the app changes nothing about how it talks to network devices (still read-only Netmiko commands, still no credentials in code, still `DEVICE_SSH_PASSWORD`/`N8N_WEBHOOK_URL` from the environment only). No device is contacted differently because it's running in a container.
+
+### Image
+
+`Dockerfile` is a multi-stage build:
+
+1. **builder** stage: installs `requirements.txt` into an isolated user site-packages directory (nothing here ends up in the final image except the installed packages).
+2. **runtime** stage: `python:3.14-slim` (Debian-based -- `psycopg2-binary`'s prebuilt wheel needs glibc, so this intentionally isn't an Alpine/musl image), copies in the installed packages and `app/` only (no tests, no `.git`, no `.env` -- see `.dockerignore`), creates and switches to a non-root `appuser`, and runs `uvicorn` on port 8001.
+
+A `HEALTHCHECK` hits `/health` every 30s so `docker ps` and `depends_on: condition: service_healthy` can see real application health, not just "the process is running."
+
+### Running with docker compose
+
+`docker-compose.yml` defines two services:
+
+| Service | Image | Notes |
+|---|---|---|
+| `db` | `postgres:18-alpine` | Named volume `postgres_data` for persistence; `pg_isready` healthcheck gates the app's startup |
+| `app` | built from `Dockerfile` | Loads `.env` for every setting except `DATABASE_URL`, which compose overrides to point at `db:5432` instead of `localhost` (the app container can't reach the host's own PostgreSQL via "localhost" -- that would mean itself) |
+
+`./logs` and `./backups` are bind-mounted into the container at the same paths the app already uses, so log files and configuration backups land directly in your project directory exactly as they do when running via `uvicorn` on the host -- nothing extra to `docker cp` out.
+
+**Setup:**
+
+1. Add three new keys to `.env` (see `.env.example`) -- these initialize the *containerized* PostgreSQL and are separate from the `DATABASE_URL` used for host-based `uvicorn` runs:
+   ```
+   POSTGRES_USER=netautoops_user
+   POSTGRES_PASSWORD=<choose a password>
+   POSTGRES_DB=netautoops_db
+   ```
+2. Build and start:
+   ```bash
+   docker compose up -d --build
+   ```
+3. Check both containers are healthy:
+   ```bash
+   docker compose ps
+   ```
+4. Verify:
+   ```bash
+   curl http://127.0.0.1:8001/health
+   curl http://127.0.0.1:8001/devices
+   ```
+5. Logs:
+   ```bash
+   docker compose logs -f app
+   # or, since it's bind-mounted:
+   tail -f logs/netautoops.log
+   ```
+6. Stop (keeps the database volume): `docker compose down`. Stop and wipe the database too: `docker compose down -v`.
+
+> If you already have PostgreSQL running natively on the host (as set up in Phase 2) and only want to containerize the *app*, run `docker build -t netautoops .` and `docker run` it directly with `DATABASE_URL` pointing at `host.docker.internal` (Docker Desktop) or the host's real IP (Linux) instead of using `docker-compose.yml`'s bundled database.
+
+### What was verified in this environment
+
+Both containers were built and run end-to-end here: `db` passed its `pg_isready` healthcheck, `app` connected to it, created all tables, and passed its own `/health` healthcheck. Every existing endpoint was re-verified against the containerized stack -- Phase 2 device CRUD, Phase 3 monitoring check + fleet health, Phase 4 backup trigger + list, Phase 5 event types -- all returned the expected status codes. Data survived a full container restart (named volume persistence confirmed), and the `logs`/`backups` bind mounts were confirmed to receive real writes from inside the container. The test-only stack was torn down afterward (`down -v`) and never left running.
+
+### requirements.txt
+
+No changes -- the same dependency set that runs on the host runs unchanged in the container (verified: `psycopg2-binary`'s wheel installs cleanly on `python:3.14-slim` with no extra system packages needed).
 
 ## Health Check
 
