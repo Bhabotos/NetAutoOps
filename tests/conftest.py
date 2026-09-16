@@ -41,3 +41,14 @@ def client():
     # startup event, which would otherwise call create_all() against the
     # real production database configured in .env.
     return TestClient(app)
+
+
+@pytest.fixture
+def db_session():
+    """A raw SQLAlchemy session against the same in-memory test database,
+    for service-layer tests that don't go through the HTTP client."""
+    session = TestingSessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
