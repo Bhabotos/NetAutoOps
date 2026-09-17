@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      # Tests never touch a real database (see tests/conftest.py -- every
+      # request is routed to an in-memory SQLite DB via a dependency
+      # override), but app/core/config.Settings() requires these two fields
+      # at import time with no default, so CI needs *some* value set.
+      DATABASE_URL: postgresql+psycopg2://ci_user:ci_password@localhost:5432/ci_db
+      JWT_SECRET_KEY: ci-test-secret-key-not-for-production
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -v
