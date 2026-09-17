@@ -6,3 +6,5 @@ logs/*
 backups/*
 .pytest_cache/
 .coverage
+frontend/node_modules/
+frontend/dist/

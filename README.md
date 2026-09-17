@@ -1,6 +1,6 @@
 # NetAutoOps
 
-A production-style Python Network Automation & Monitoring Platform. NetAutoOps manages network device inventory, monitors device health, collects interface information, performs configuration backups, exposes REST APIs, integrates with n8n, sends alerts, and secures every endpoint with JWT authentication and role-based access control.
+A production-style Python Network Automation & Monitoring Platform. NetAutoOps manages network device inventory, monitors device health, collects interface information, performs configuration backups, exposes REST APIs, integrates with n8n, sends alerts, secures every endpoint with JWT authentication and role-based access control, and ships a React NOC dashboard for day-to-day operations.
 
 ## Project Structure
 
@@ -17,6 +17,15 @@ NetAutoOps/
 │   ├── scheduler/      # background job scheduler (health/backup/interface checks)
 │   └── utils/         # logging and shared helpers
 ├── tests/            # pytest test suite
+├── frontend/          # React + TypeScript NOC dashboard (see Phase 10)
+│   ├── src/
+│   │   ├── api/        # typed fetch client, one module per backend router
+│   │   ├── auth/       # AuthContext, RequireAuth, RequireRole
+│   │   ├── components/ # Sidebar, Header, StatCard, ConfirmDialog, ToastProvider, ...
+│   │   ├── pages/       # one page per route (Dashboard, Devices, Monitoring, ...)
+│   │   └── types/       # TypeScript interfaces mirroring the backend's Pydantic schemas
+│   ├── Dockerfile      # multi-stage: node build -> nginx runtime
+│   └── nginx.conf       # serves the SPA, reverse-proxies /api/ to the backend
 ├── config/
 ├── logs/
 ├── backups/
@@ -24,7 +33,7 @@ NetAutoOps/
 ├── .env.example      # documents required env vars (no real values)
 ├── .gitignore
 ├── Dockerfile         # multi-stage build, runs as non-root
-├── docker-compose.yml # app + PostgreSQL for a fully containerized deployment
+├── docker-compose.yml # app + PostgreSQL + frontend for a fully containerized deployment
 ├── .dockerignore
 ├── README.md
 └── requirements.txt
@@ -978,6 +987,201 @@ working token; a second registration as `viewer` correctly has its requested rol
 honored (since an admin token was supplied); that viewer's token can read `/devices`
 but gets `403` attempting `POST /devices`; `logs/netautoops.log` was checked and
 contains no password or token value anywhere in it.
+
+## Phase 10 — Frontend / NOC Dashboard
+
+Phase 10 adds a React NOC-style operations dashboard on top of the Phase 2-9 API --
+device inventory, health/interface monitoring, configuration backups, scheduled
+checks, and RBAC are now something an operator clicks through instead of `curl`s.
+
+**Backend change:** exactly one small, additive, read-only endpoint was added to
+support this phase -- `GET /alarms` (see below). Nothing else in `app/` changed
+behavior; every one of the 165 pre-Phase-10 tests still passes unmodified.
+
+### Why `GET /alarms`
+
+The backend never persisted an event/alarm history -- `event_service.dispatch_event()`
+only ever POSTs live to the n8n webhook and logs it, and `/monitoring/health` /
+`/interfaces/health` only return the *current* snapshot per device/interface, not a
+timeline. A NOC dashboard needs a "what's wrong right now" feed, so
+`app/services/alarm_service.py::get_recent_alarms()` was added -- it does **not**
+introduce a new table or write path; it reuses `monitoring_service.get_fleet_health()`
+and `interface_service.get_fleet_interfaces()` (the exact same "current state" logic
+`/monitoring/health` and `/interfaces/health` already use) and merges every device
+whose latest health check is `down`/`error` with every interface that's `down` or
+carrying errors, most recently observed first.
+
+| Method | Path | Access | Description |
+|---|---|---|---|
+| GET | `/alarms?limit=50` | any authenticated user | Every currently-active problem across the fleet |
+
+### Architecture
+
+```
+frontend/
+├── src/api/          # apiFetch() wrapper (client.ts) + one typed module per
+│                      # backend router (devices.ts, monitoring.ts, backups.ts, ...)
+├── src/types/         # TypeScript interfaces mirroring the backend's Pydantic
+│                      # schemas 1:1 (kept in sync by hand -- no codegen)
+├── src/auth/           # AuthContext (token + current user), RequireAuth,
+│                      # RequireRole (mirrors app/api/deps.py's ROLE_LEVEL ordering)
+├── src/components/     # Sidebar, Header, StatCard, StatusBadge, ConfirmDialog,
+│                      # ToastProvider, EmptyState, ErrorState, LoadingSpinner
+├── src/pages/          # one page per route: Dashboard, Devices, DeviceDetail,
+│                      # Monitoring, Backups, Alarms, Scheduler, Users (admin-only)
+├── frontend/Dockerfile # multi-stage: node build -> nginx runtime
+└── frontend/nginx.conf # serves the SPA, reverse-proxies /api/ to the backend
+```
+
+**Stack**: React 19 + TypeScript + Vite, Tailwind CSS v4 (hand-built components, no
+UI library) for a dark NOC-style visual language, Recharts for the two dashboard
+status donuts, `@tanstack/react-query` for data fetching/caching/loading-and-error
+states, `react-router-dom` for routing. No axios -- `src/api/client.ts` is a thin
+wrapper over native `fetch`.
+
+**No CORS middleware was added to the backend.** Both in local dev (Vite's
+`server.proxy` in `vite.config.ts`) and in Docker (`frontend/nginx.conf`'s
+`location /api/`), the frontend talks to the backend through a same-origin reverse
+proxy, so the browser only ever calls the frontend's own origin with relative
+`/api/...` paths -- it never makes a cross-origin request to the FastAPI backend, so
+`app/main.py`'s CORS posture never needed to change.
+
+### Login flow
+
+1. `POST /auth/login` with `{username, password}` returns a JWT (see Phase 9).
+2. The token is stored in the browser's `localStorage` (the only option, since the
+   backend only supports header bearer tokens, not cookies) and attached as
+   `Authorization: Bearer <token>` on every subsequent API call.
+3. On every page load, if a token is stored, `GET /auth/me` re-validates it and
+   hydrates the current user; an invalid/expired token clears the session and
+   redirects to `/login`.
+4. Any `401` response from *any* API call -- including a background React Query
+   refetch -- clears the session and redirects to `/login` immediately (see
+   `configureApiClient`'s `onUnauthorized` callback in `src/api/client.ts`).
+5. Logging out clears the token and navigates back to `/login`.
+
+### Roles in the UI
+
+| Role | Sees |
+|---|---|
+| Viewer | Every page, read-only -- no create/edit/delete/trigger controls render at all (not just disabled) |
+| Operator | Everything Viewer sees, plus device create/edit/delete, triggering health/interface checks and backups |
+| Admin | Everything Operator sees, plus the Users page (list accounts, change role, activate/deactivate) |
+
+**The backend remains the sole authority.** `RequireRole` in the frontend only
+decides what to *render* -- it mirrors `app/api/deps.py`'s `ROLE_LEVEL` ordering
+purely so a lower-privileged user doesn't hit a confusing dead end. Every mutating
+request still goes through the real `require_operator`/`require_admin` FastAPI
+dependencies; if a role changes mid-session (an admin demotes the current user)
+the next mutating call gets a real `403` from the backend, which the UI surfaces as
+a toast rather than crashing.
+
+### Error handling
+
+`src/components/ErrorState.tsx` maps every `ApiError` (thrown by `src/api/client.ts`)
+to an inline panel with a Retry button, so no page is ever left blank on failure:
+
+| Status | Shown as |
+|---|---|
+| `401` | Handled globally -- session cleared, redirected to `/login`, never reaches page code |
+| `403` | "You don't have permission" |
+| `404` | "Not found" |
+| `500` / other | "Server error" |
+| Network failure (`fetch` throws) | "Can't reach the API" |
+
+### Security
+
+No secret of any kind lives in frontend source or the built bundle: the JWT exists
+only in the browser's `localStorage` at runtime (set after a successful login, never
+hardcoded), `VITE_API_PROXY_TARGET` (dev-only, defaults to `http://localhost:8001`)
+carries no credential, and device SSH passwords are never returned by any endpoint
+the frontend calls, so there is nothing to accidentally render -- `DeviceForm.tsx`
+and the backup views never show or collect a device password.
+
+### Local development
+
+```bash
+# Terminal 1 -- backend (see Setup above for .env)
+uvicorn app.main:app --reload --port 8001
+
+# Terminal 2 -- frontend
+cd frontend
+npm install
+npm run dev   # http://localhost:5173, proxies /api/* to http://localhost:8001
+```
+
+Bootstrap the first account if you haven't already (see Phase 9), then log in at
+`http://localhost:5173`.
+
+### Docker deployment
+
+`docker-compose.yml` now has three services -- `db` and `app` are unchanged from
+Phase 6, plus:
+
+| Service | Image | Notes |
+|---|---|---|
+| `frontend` | built from `frontend/Dockerfile` | `node:22-slim` build stage -> `nginx:1.27-alpine` runtime; depends on `app`; port `3001:80` (`3000` is a common default for other local tooling, so this deliberately picks a less contested port) |
+
+```bash
+docker compose up -d --build
+curl http://127.0.0.1:3001/           # dashboard HTML
+curl http://127.0.0.1:3001/api/health # proxied through to the app container
+```
+
+Open `http://localhost:3001` in a browser and log in. `logs/`/`backups/` bind mounts
+and the `db`/`app` services behave exactly as documented in Phase 6 -- nothing about
+them changed.
+
+### Testing
+
+**Backend**: `tests/test_alarms.py` (new, 8 tests) covers `GET /alarms` -- empty
+fleet, a down device, a health-check error, a healthy device producing no alarm, an
+interface that's both down and carrying errors deduplicating to one entry, the
+`limit` parameter, ordering, and the `401` case. All 6 pre-existing test files are
+untouched.
+
+```bash
+pytest -q   # 173 passed (165 existing + 8 new)
+```
+
+**Frontend**: Vitest + React Testing Library, mocking at the `fetch` boundary only
+(same "mock at the outermost boundary" convention the Python suite uses for
+Netmiko/`httpx.post`) -- no real network call in any frontend test.
+
+- `src/api/client.test.ts` -- `apiFetch` maps `401`/`403`/`404`/`500`/network-failure
+  to the right `ApiError`, and attaches the bearer token.
+- `src/auth/AuthContext.test.tsx` -- hydrates from a stored token via `/auth/me`,
+  clears an invalid session, `login`/`logout` update state and `localStorage`, and a
+  `401` from any background call triggers the global session-clear.
+- `src/pages/LoginPage.test.tsx` -- renders, shows an inline error on `401`, shows a
+  network-unreachable message, and reaches the authenticated state on success.
+- `src/auth/RequireAuth.test.tsx` -- redirects to `/login` when unauthenticated,
+  renders protected content once authenticated.
+- `src/auth/RequireRole.test.tsx` -- blocks `viewer`/`operator` from an admin-only
+  route, allows `admin`.
+- `src/pages/DevicesPage.test.tsx` -- a `viewer` sees the device table with no
+  create/edit/delete controls at all; `operator`/`admin` see them; a failed fetch
+  renders the inline error state.
+
+```bash
+cd frontend
+npm run build   # tsc -b && vite build -- must produce zero TypeScript errors
+npm run test    # vitest run
+```
+
+### What was verified in this environment
+
+Backend: `pytest -q` -- 173 passed. Frontend: `npm run build` produced a clean
+production bundle with zero TypeScript errors; `npm run test` -- 25 passed. Live,
+end-to-end, against the real running backend and its real PostgreSQL database (not
+mocks): started `uvicorn` + `vite dev` with the proxy pointed at it, confirmed
+`GET /api/health` and `GET /api/devices` (401 without a token) both round-trip
+correctly through the proxy, logged in as a real admin account from earlier Phase 9
+testing, created a device with an RFC 5737 `TEST-NET` address (safe, non-routable),
+triggered a real health check against it (no mocks), confirmed it came back `down`
+and immediately appeared in `GET /api/alarms`, then deleted the device to leave the
+database clean. `docker compose up -d --build` was run to build and start all three
+containers together (see Docker deployment above).
 
 ## Health Check
 

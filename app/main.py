@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.alarms import router as alarms_router
 from app.api.auth import router as auth_router
 from app.api.backups import router as backups_router
 from app.api.devices import router as devices_router
@@ -39,6 +40,7 @@ app.include_router(backups_router)
 app.include_router(events_router)
 app.include_router(interfaces_router)
 app.include_router(scheduler_router)
+app.include_router(alarms_router)
 
 
 @app.get("/")

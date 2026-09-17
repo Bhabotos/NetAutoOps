@@ -40,6 +40,16 @@ services:
     networks:
       - netautoops_net
 
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "3001:80"
+    networks:
+      - netautoops_net
+
 volumes:
   postgres_data:
 
