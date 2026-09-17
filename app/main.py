@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.auth import router as auth_router
 from app.api.backups import router as backups_router
 from app.api.devices import router as devices_router
 from app.api.events import router as events_router
@@ -31,6 +32,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(auth_router)
 app.include_router(devices_router)
 app.include_router(monitoring_router)
 app.include_router(backups_router)

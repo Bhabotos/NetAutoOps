@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     backup_interval_minutes: int = 1440
     interface_check_interval_minutes: int = 15
 
+    # Phase 9: JWT authentication. jwt_secret_key has no default -- it must be
+    # set explicitly in .env (generate one with
+    # `python -c "import secrets; print(secrets.token_hex(32))"`). Tokens
+    # never embed a role; app/api/deps.py always re-reads role/is_active from
+    # the database on every request.
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 60
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

@@ -1,6 +1,6 @@
 # NetAutoOps
 
-A production-style Python Network Automation & Monitoring Platform. NetAutoOps manages network device inventory, monitors device health, collects interface information, performs configuration backups, exposes REST APIs, integrates with n8n, and sends alerts.
+A production-style Python Network Automation & Monitoring Platform. NetAutoOps manages network device inventory, monitors device health, collects interface information, performs configuration backups, exposes REST APIs, integrates with n8n, sends alerts, and secures every endpoint with JWT authentication and role-based access control.
 
 ## Project Structure
 
@@ -67,6 +67,12 @@ SCHEDULER_ENABLED=true
 HEALTH_CHECK_INTERVAL_MINUTES=15
 BACKUP_INTERVAL_MINUTES=1440
 INTERFACE_CHECK_INTERVAL_MINUTES=15
+
+# Phase 9 authentication (see below) -- required, no default; generate with
+# `python -c "import secrets; print(secrets.token_hex(32))"`
+JWT_SECRET_KEY=
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
 ```
 
 Run the API server:
@@ -855,6 +861,123 @@ pytest tests/ -v
 ### Docker
 
 No Dockerfile/docker-compose.yml changes were needed -- the scheduler is just additional in-process behavior of the same `app.main:app` ASGI app already running under `uvicorn` in the container; `docker compose up` starts it automatically. Verified in this environment: rebuilt the image, brought up the full stack, and confirmed `Scheduler started ...` in the container logs plus a healthy `GET /scheduler/status` response before tearing the test stack down.
+
+## Phase 9 — Authentication & Authorization
+
+Phase 9 closes the access-control gap left by every prior phase: **every** endpoint
+except `/` and `/health` (the latter is left public because Docker's `HEALTHCHECK`
+depends on it) now requires a valid bearer token, with three roles gating what that
+token is allowed to do.
+
+**Safety rules enforced by design:** passwords are never stored or logged in
+plaintext (only a `bcrypt` hash); a login failure never reveals *why* it failed
+(unknown username, wrong password, and a deactivated account all return the same
+generic 401); a JWT never embeds a role -- every request re-reads the caller's
+current role and `is_active` flag from the database, so revoking access or changing
+someone's role takes effect on their very next request instead of waiting out the
+token's remaining lifetime; `JWT_SECRET_KEY` is treated like any other credential
+(only in `.env`, required with no default, never logged).
+
+### Roles
+
+| Role | Can do |
+|---|---|
+| `viewer` | Read-only: every `GET` endpoint (device inventory, health, backups, interfaces, scheduler status, event types) |
+| `operator` | Everything `viewer` can, plus every mutating action: create/update/delete devices, trigger health/interface checks and backups, send a test event |
+| `admin` | Everything `operator` can, plus manage user accounts: register new users with any role, list all users, change a user's role or deactivate them |
+
+### Architecture
+
+```
+app/models/user.py            # NEW: `users` table + UserRole enum
+app/core/security.py          # NEW: bcrypt hashing, JWT create/decode (no role in the token)
+app/api/deps.py                # NEW: get_current_user (re-reads role/is_active from
+                               #      the DB every request), require_operator, require_admin
+app/api/auth_schemas.py        # NEW: UserCreate/UserUpdate/UserResponse/LoginRequest/Token
+app/services/user_service.py   # NEW: create/authenticate/list/get/update, custom exceptions
+app/api/auth.py                # NEW: /auth/* endpoints
+```
+
+Every existing router (`devices`, `monitoring`, `backups`, `events`, `interfaces`,
+`scheduler`) gained an explicit `current_user: User = Depends(...)` parameter on each
+route -- `get_current_user` for `GET`s, `require_operator` for `POST`/`PUT`/`DELETE` --
+matching this codebase's existing style of threading `db: Session = Depends(get_db)`
+explicitly through every route rather than hiding it behind router-level
+`dependencies=[...]`.
+
+### First account (bootstrap)
+
+`POST /auth/register` is open with **no token** only while the `users` table is
+completely empty -- the very first account created this way is always forced to
+`admin`, regardless of the `role` field in the request body. Once any user exists,
+every subsequent `/auth/register` call requires a valid `admin` token, and the
+requested role is honored.
+
+### API Endpoints
+
+| Method | Path | Access | Description |
+|---|---|---|---|
+| POST | `/auth/register` | open (bootstrap only) or `admin` | Create a user account |
+| POST | `/auth/login` | public | Exchange `username`/`password` for a bearer token |
+| GET | `/auth/me` | any authenticated user | The caller's own account |
+| GET | `/auth/users` | `admin` | List every account |
+| PATCH | `/auth/users/{user_id}` | `admin` | Change a user's `role` and/or `is_active` |
+
+### Example usage
+
+```bash
+# 1. Bootstrap the first account (only works while zero users exist -- always admin)
+curl -X POST http://127.0.0.1:8001/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "email": "admin@example.com", "password": "change-me-now"}'
+
+# 2. Log in to get a token
+TOKEN=$(curl -s -X POST http://127.0.0.1:8001/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "change-me-now"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+
+# 3. Use the token on any protected endpoint
+curl http://127.0.0.1:8001/devices -H "Authorization: Bearer $TOKEN"
+
+# 4. Register an operator account for day-to-day use (requires the admin token)
+curl -X POST http://127.0.0.1:8001/auth/register \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"username": "oncall", "email": "oncall@example.com", "password": "another-password", "role": "operator"}'
+```
+
+`/` and `/health` stay reachable with no token at all -- everything else returns
+`401` without a valid `Authorization: Bearer <token>` header, and `403` if the token
+is valid but the account's role is too low for that action.
+
+### Testing
+
+`tests/test_auth.py` covers registration (bootstrap, admin-only after bootstrap,
+duplicate username/email, short password, missing fields), login (success, wrong
+password, unknown username, inactive account), `/auth/me`, user listing/updates
+(admin-only, 404 on an unknown id), and RBAC spot-checks (a viewer token blocked from
+`POST /devices`, an operator token blocked from `/auth/users`, no token at all on a
+protected route). None of the other 6 existing test files needed to change: the
+shared `client` fixture in `tests/conftest.py` now seeds one fixed admin account
+directly into the test database and attaches its token as a default header on every
+request that fixture makes, so the ~150 pre-existing tests keep working unmodified
+while every route is still genuinely protected. Tests that need to check the
+unauthenticated/insufficient-role paths build their own plain client or
+role-specific token instead of using that fixture.
+
+```bash
+pytest tests/ -v
+```
+
+### Live verification performed in this environment
+
+Ran against the real configured PostgreSQL database (`uvicorn app.main:app --port
+8001`): confirmed `/` and `/health` stay reachable with no token; `GET /devices`
+without a token returns `401`; bootstrap registration of the very first account
+returns `role: "admin"` even though `"viewer"` was requested; logging in returns a
+working token; a second registration as `viewer` correctly has its requested role
+honored (since an admin token was supplied); that viewer's token can read `/devices`
+but gets `403` attempting `POST /devices`; `logs/netautoops.log` was checked and
+contains no password or token value anywhere in it.
 
 ## Health Check
 
